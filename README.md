@@ -1,4 +1,4 @@
-# Monte Carlo Silver: Risk, Forecasting, and Option Pricing
+# Silver Quantitative Research: Risk, Forecasting & Option Pricing
 
 A silver-price research project built around three genuinely different questions, kept in
 separate modules on purpose because they answer different things:
