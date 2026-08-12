@@ -15,6 +15,24 @@ across 4 horizons and market regimes, nothing beats a naive random-walk baseline
 survives multiple-comparison correction. That's not a bug — it's the actual, load-bearing
 finding, detailed in [Key findings](#key-findings) below.
 
+## Results at a glance
+
+Snapshot from a run on **2026-08-12** — spot price, rates, and GARCH vol are all live inputs, so
+rerunning `main.py` / `option_main.py` today will print different (nearby) numbers. That's
+expected, not drift to be alarmed by.
+
+| | |
+|---|---|
+| GARCH(1,1) annualized volatility | 39.12% (spot $66.78, 5y history) |
+| Black-Scholes 63d ATM call | $5.51 |
+| Monte Carlo (200k paths, antithetic + control variate) | $5.52, within the BS 95% CI |
+| Best forecasting model, 5y OOS | `historical_mean`, R² ≈ **+0.014** vs. random walk — every ML model did worse |
+| CFTC COT positioning | no stable incremental OOS value (ablation-tested, sign-unstable across refits) |
+| Best model's trading strategy vs. buy-and-hold | **underperformed** (+88-103% vs. +150% total return, 5y window) |
+
+Full detail, including the 10-year-window numbers and the multi-horizon/regime sweep, is in
+[Key findings](#key-findings) below.
+
 ## Setup
 
 ```bash
