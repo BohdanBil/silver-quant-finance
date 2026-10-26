@@ -1,8 +1,9 @@
-numpy
-pandas
-matplotlib
-yfinance
-scipy
-scikit-learn
-xgboost
-requests
+numpy==2.5.2
+pandas==3.0.5
+matplotlib==3.11.1
+yfinance==1.5.2
+scipy==1.18.0
+scikit-learn==1.9.0
+xgboost==3.4.0
+requests==2.34.2
+pytest==9.1.1

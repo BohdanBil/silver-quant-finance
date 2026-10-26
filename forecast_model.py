@@ -2,11 +2,10 @@
 
 import warnings
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Iterator
 
 import numpy as np
 import pandas as pd
-from scipy.stats import binomtest
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 from sklearn.linear_model import ElasticNetCV, LassoCV, LinearRegression, Ridge
@@ -16,27 +15,9 @@ from sklearn.preprocessing import StandardScaler
 from xgboost import XGBRegressor
 
 from data import TRADING_DAYS_PER_YEAR
+from significance import clark_west, pesaran_timmermann
 
 ModelName = str
-
-# LassoCV/ElasticNetCV's auto alpha path includes small-alpha candidates
-# that sometimes don't fully converge within max_iter -- worse at short
-# horizons, where the target scale (e.g. 1-day returns) shifts the whole
-# regularization path. eps=1e-2 below was tuned against 21d-scale targets
-# and doesn't fully clear it at 1d/5d. Not independently verified that this
-# leaves the *selected* alpha's coefficients unbiased (unlike the Monte
-# Carlo option pricer, which was checked this way) -- the practical
-# argument is that CV rarely picks the smallest, least-regularized alphas
-# on the path anyway, so the unconverged candidates are usually the ones
-# losing the internal CV comparison, not the one that ships. Silenced
-# because at 1d/5d horizons it produced enough warning spam to bury the
-# actual walk-forward results in one run.
-warnings.filterwarnings("ignore", category=ConvergenceWarning)
-
-# Internal CV for the *CV models must respect time order too -- a random
-# K-fold would let a training fold sit chronologically after a validation
-# fold, leaking future information into the alpha selection itself.
-_TSCV = TimeSeriesSplit(n_splits=5)
 
 MOMENTUM_COLUMNS = ["silver_ret_21d"]
 AR_COLUMNS = ["silver_ret_1d", "silver_ret_5d", "silver_ret_21d"]
@@ -45,7 +26,7 @@ COT_COLUMNS = ["cot_mm_net_pct_oi", "cot_mm_net_pct_oi_chg_21d", "cot_comm_net_p
 
 class ZeroReturnModel:
     """Baseline: always predicts 0 -- the pure random-walk call. This is
-    also exactly what oos_r2_vs_naive uses as its denominator, so this
+    also exactly what oos_r2_vs_zero uses as its denominator, so this
     model's own OOS R^2 is 0.0 by construction; it's included as an
     explicit row so that's a visible anchor in the comparison table, not
     just an invisible constant baked into a formula.
@@ -62,7 +43,7 @@ class MeanReturnModel:
     """Baseline: always predicts the training set's historical mean return
     (unconditional drift, no timing) -- distinct from ZeroReturnModel
     whenever the sample mean return isn't ~0, e.g. silver's multi-year bull
-    run.
+    run. Also the benchmark behind oos_r2_vs_mean.
     """
 
     def __init__(self) -> None:
@@ -100,29 +81,120 @@ class ColumnSubsetLinearModel:
         return self._reg.coef_
 
 
+def _time_series_cv(horizon_days: int) -> TimeSeriesSplit:
+    """Internal CV for the *CV models' alpha selection.
+
+    Folds must respect time order, and need a horizon_days gap: training
+    labels are forward returns, so without one the last rows of each
+    training fold have targets that overlap the validation fold's period,
+    leaking it into the choice of alpha.
+    """
+    return TimeSeriesSplit(n_splits=5, gap=horizon_days)
+
+
 BASELINE_MODELS = {"zero_return", "historical_mean", "momentum", "ar"}
 LINEAR_MODELS = {"ridge", "lasso", "elasticnet", "momentum", "ar"}
+SIGNED_ML_MODELS = ["ridge", "lasso", "elasticnet"]  # non-baseline models with signed coefficients
 
-MODEL_FACTORIES: dict[ModelName, Callable] = {
-    "zero_return": lambda: ZeroReturnModel(),
-    "historical_mean": lambda: MeanReturnModel(),
-    "momentum": lambda: ColumnSubsetLinearModel(MOMENTUM_COLUMNS),
-    "ar": lambda: ColumnSubsetLinearModel(AR_COLUMNS),
-    "ridge": lambda: make_pipeline(StandardScaler(), Ridge(alpha=1.0)),
-    "lasso": lambda: make_pipeline(StandardScaler(), LassoCV(cv=_TSCV, alphas=50, eps=1e-2, max_iter=10_000)),
-    "elasticnet": lambda: make_pipeline(
-        StandardScaler(),
-        ElasticNetCV(cv=_TSCV, l1_ratio=[0.1, 0.5, 0.9, 1.0], alphas=50, eps=1e-2, max_iter=10_000),
+MODEL_FACTORIES: dict[ModelName, Callable[[int], object]] = {
+    "zero_return": lambda h: ZeroReturnModel(),
+    "historical_mean": lambda h: MeanReturnModel(),
+    "momentum": lambda h: ColumnSubsetLinearModel(MOMENTUM_COLUMNS),
+    "ar": lambda h: ColumnSubsetLinearModel(AR_COLUMNS),
+    "ridge": lambda h: make_pipeline(StandardScaler(), Ridge(alpha=1.0)),
+    "lasso": lambda h: make_pipeline(
+        StandardScaler(), LassoCV(cv=_time_series_cv(h), alphas=50, eps=1e-2, max_iter=10_000)
     ),
-    "random_forest": lambda: RandomForestRegressor(
+    "elasticnet": lambda h: make_pipeline(
+        StandardScaler(),
+        ElasticNetCV(cv=_time_series_cv(h), l1_ratio=[0.1, 0.5, 0.9, 1.0], alphas=50, eps=1e-2, max_iter=10_000),
+    ),
+    "random_forest": lambda h: RandomForestRegressor(
         n_estimators=200, max_depth=4, min_samples_leaf=5, random_state=0
     ),
-    "gbm": lambda: GradientBoostingRegressor(max_depth=3, n_estimators=100, random_state=0),
-    "xgboost": lambda: XGBRegressor(
+    "gbm": lambda h: GradientBoostingRegressor(max_depth=3, n_estimators=100, random_state=0),
+    "xgboost": lambda h: XGBRegressor(
         max_depth=3, n_estimators=100, learning_rate=0.05, subsample=0.8, colsample_bytree=0.8,
         reg_lambda=1.0, random_state=0,
     ),
 }
+
+
+def build_model(model_name: ModelName, horizon_days: int):
+    return MODEL_FACTORIES[model_name](horizon_days)
+
+
+def _fit(model, X: pd.DataFrame, y: pd.Series):
+    """Fit with sklearn's ConvergenceWarning silenced, for this call only.
+
+    LassoCV/ElasticNetCV's alpha path includes small-alpha candidates that
+    don't always converge within max_iter, mostly at 1d/5d horizons where
+    the target's scale shifts the path. Those barely-regularized candidates
+    are rarely the ones internal CV picks, and the warnings otherwise bury
+    the walk-forward output.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ConvergenceWarning)
+        return model.fit(X, y)
+
+
+def _coefficients(model, model_name: ModelName) -> np.ndarray:
+    if model_name in ("momentum", "ar"):
+        return model.coef_
+    return model[-1].coef_  # last pipeline step is the linear model (standardized coefficients)
+
+
+def _walk_forward_steps(n: int, horizon_days: int, min_train_size: int,
+                        test_step: int | None) -> Iterator[tuple[int, int]]:
+    """(test_index, train_end) pairs for an expanding-window walk-forward with a purge gap.
+
+    y[t] already encodes information through t+horizon_days (it's a forward
+    return), so each step only trains on rows before test_index -
+    horizon_days: any later training label would overlap the test point's
+    own window.
+
+    test_step controls how far the test point advances each iteration; it
+    defaults to horizon_days, which gives non-overlapping test targets (the
+    standard, safest choice). A larger test_step subsamples test points to
+    cap the number of refits -- horizon=1 would otherwise refit at every
+    single row. A smaller one would make consecutive targets overlap,
+    inflating the apparent sample size without adding information, so it
+    isn't allowed.
+    """
+    if horizon_days >= min_train_size:
+        raise ValueError("min_train_size must exceed horizon_days")
+    if test_step is None:
+        test_step = horizon_days
+    elif test_step < horizon_days:
+        raise ValueError("test_step must be >= horizon_days, or targets overlap between test points")
+    for i in range(min_train_size, n, test_step):
+        yield i, i - horizon_days
+
+
+def forecast_metrics(preds: np.ndarray, actuals: np.ndarray, bench_mean: np.ndarray) -> dict:
+    """Out-of-sample metrics shared by a full walk-forward run and any post-hoc
+    slice of its predictions (e.g. regime_conditional_metrics), so the two are
+    never computed two subtly different ways.
+
+    oos_r2_vs_zero: 1 - SSE(model) / SSE(predict 0), the random-walk
+    benchmark (as in Gu, Kelly & Xiu 2020). oos_r2_vs_mean: against the
+    expanding historical mean instead (Campbell & Thompson 2008) -- a
+    tougher bar whenever the sample has a strong drift. cw_pvalue:
+    Clark-West test of the model against the random walk. pt_pvalue:
+    Pesaran-Timmermann test of directional skill. Both one-sided.
+    """
+    n = len(actuals)
+    sse_model = np.sum((actuals - preds) ** 2)
+    sse_zero = np.sum(actuals**2)
+    sse_mean = np.sum((actuals - bench_mean) ** 2)
+    return {
+        "n_predictions": n,
+        "oos_r2_vs_zero": float(1 - sse_model / sse_zero) if sse_zero > 0 else float("nan"),
+        "oos_r2_vs_mean": float(1 - sse_model / sse_mean) if sse_mean > 0 else float("nan"),
+        "cw_pvalue": clark_west(actuals, preds, np.zeros(n)),
+        "directional_accuracy": float(np.mean((preds > 0) == (actuals > 0))) if n else float("nan"),
+        "pt_pvalue": pesaran_timmermann(actuals, preds),
+    }
 
 
 @dataclass
@@ -131,33 +203,8 @@ class WalkForwardResult:
     dates: pd.DatetimeIndex
     y_true: np.ndarray
     y_pred: np.ndarray
-    oos_r2_vs_naive: float
-    directional_accuracy: float
-    directional_pvalue: float
-    n_predictions: int
-
-
-def _compute_metrics(preds: np.ndarray, actuals: np.ndarray) -> dict:
-    """Shared OOS R^2 / directional-accuracy / binomial-p-value calc, used by
-    both a full walk-forward run and any post-hoc slice of its predictions
-    (e.g. regime_conditional_metrics) -- one definition, so a regime slice
-    and the full-sample number are never computed two subtly different ways.
-    """
-    n = len(actuals)
-    ss_res_model = np.sum((actuals - preds) ** 2)
-    ss_res_naive = np.sum(actuals**2)
-    oos_r2 = 1 - ss_res_model / ss_res_naive if ss_res_naive > 0 else float("nan")
-
-    n_correct = int(np.sum(np.sign(preds) == np.sign(actuals)))
-    directional_accuracy = n_correct / n if n > 0 else float("nan")
-    p_value = binomtest(n_correct, n, 0.5, alternative="two-sided").pvalue if n > 0 else float("nan")
-
-    return {
-        "n_predictions": n,
-        "oos_r2_vs_naive": float(oos_r2),
-        "directional_accuracy": float(directional_accuracy),
-        "directional_pvalue": float(p_value),
-    }
+    y_bench_mean: np.ndarray  # the historical-mean benchmark's prediction at each test point
+    metrics: dict
 
 
 def walk_forward_validate(
@@ -168,64 +215,23 @@ def walk_forward_validate(
     min_train_size: int = 504,
     test_step: int | None = None,
 ) -> WalkForwardResult:
-    """Expanding-window walk-forward backtest with a purge gap.
-
-    y[t] already encodes information through t+horizon_days (it's a forward
-    return). Refitting naively at every row would let training labels near
-    the test point leak information from inside the test point's own
-    window. So each step only trains on rows up to (test_index -
-    horizon_days).
-
-    test_step controls how far the test point advances each iteration;
-    it defaults to horizon_days, which gives non-overlapping test targets
-    (the standard, safest choice). A larger test_step is sometimes used to
-    subsample test points and cap the number of refits -- e.g. horizon=1
-    would otherwise refit at every single row -- while a smaller test_step
-    would make consecutive targets overlap and isn't allowed here for the
-    same reason the VaR backtest flags overlapping windows as
-    autocorrelated: it would inflate the apparent sample size without
-    adding real information.
-
-    oos_r2_vs_naive: 1 - SS_res(model) / SS_res(naive), where naive always
-    predicts 0 return (pure random walk). This is the standard
-    Campbell-Thompson-style out-of-sample R^2 used in the return-
-    predictability literature -- positive means the model beat a coin flip
-    at guessing the *level* of the return, not just its sign.
-    """
-    if horizon_days >= min_train_size:
-        raise ValueError("min_train_size must exceed horizon_days")
-    if test_step is None:
-        test_step = horizon_days
-    elif test_step < horizon_days:
-        raise ValueError("test_step must be >= horizon_days, or targets overlap between test points")
-
-    build_model = MODEL_FACTORIES[model_name]
-    n = len(X)
-
-    preds, actuals, dates = [], [], []
-    i = min_train_size
-    while i < n:
-        train_end = i - horizon_days
-        model = build_model()
-        model.fit(X.iloc[:train_end], y.iloc[:train_end])
+    """Expanding-window walk-forward backtest with a purge gap (see _walk_forward_steps)."""
+    preds, actuals, bench, dates = [], [], [], []
+    for i, train_end in _walk_forward_steps(len(X), horizon_days, min_train_size, test_step):
+        model = _fit(build_model(model_name, horizon_days), X.iloc[:train_end], y.iloc[:train_end])
         preds.append(model.predict(X.iloc[[i]])[0])
         actuals.append(y.iloc[i])
+        bench.append(y.iloc[:train_end].mean())
         dates.append(X.index[i])
-        i += test_step
 
-    preds = np.asarray(preds)
-    actuals = np.asarray(actuals)
-    metrics = _compute_metrics(preds, actuals)
-
+    preds, actuals, bench = np.asarray(preds), np.asarray(actuals), np.asarray(bench)
     return WalkForwardResult(
         model_name=model_name,
         dates=pd.DatetimeIndex(dates),
         y_true=actuals,
         y_pred=preds,
-        oos_r2_vs_naive=metrics["oos_r2_vs_naive"],
-        directional_accuracy=metrics["directional_accuracy"],
-        directional_pvalue=metrics["directional_pvalue"],
-        n_predictions=metrics["n_predictions"],
+        y_bench_mean=bench,
+        metrics=forecast_metrics(preds, actuals, bench),
     )
 
 
@@ -237,7 +243,7 @@ def compare_models(
     model_names: list[ModelName] | None = None,
     test_step: int | None = None,
 ) -> tuple[pd.DataFrame, dict[ModelName, WalkForwardResult]]:
-    """Run walk_forward_validate for every model and rank by OOS R^2.
+    """Run walk_forward_validate for every model and rank by OOS R^2 vs the random walk.
 
     Returns (summary_df, results_by_model) so callers can both print/inspect
     the ranking and pull the winner's raw predictions (e.g. for
@@ -246,23 +252,17 @@ def compare_models(
     model_names = model_names or list(MODEL_FACTORIES.keys())
     results = {
         name: walk_forward_validate(X, y, horizon_days=horizon_days, model_name=name,
-                                     min_train_size=min_train_size, test_step=test_step)
+                                    min_train_size=min_train_size, test_step=test_step)
         for name in model_names
     }
     summary = pd.DataFrame(
-        {
-            "model": name,
-            "n_predictions": r.n_predictions,
-            "oos_r2_vs_naive": r.oos_r2_vs_naive,
-            "directional_accuracy": r.directional_accuracy,
-            "p_value": r.directional_pvalue,
-        }
-        for name, r in results.items()
-    ).sort_values("oos_r2_vs_naive", ascending=False).reset_index(drop=True)
+        {"model": name, **r.metrics} for name, r in results.items()
+    ).sort_values("oos_r2_vs_zero", ascending=False).reset_index(drop=True)
     return summary, results
 
 
-def fit_full_and_explain(X: pd.DataFrame, y: pd.Series, model_name: ModelName = "ridge") -> pd.Series | None:
+def fit_full_and_explain(X: pd.DataFrame, y: pd.Series, horizon_days: int,
+                         model_name: ModelName = "ridge") -> pd.Series | None:
     """Fit on the full dataset and return per-feature coefficients/importances.
 
     This is an in-sample fit purely for interpretability (which factors the
@@ -274,74 +274,69 @@ def fit_full_and_explain(X: pd.DataFrame, y: pd.Series, model_name: ModelName = 
     if model_name in ("zero_return", "historical_mean"):
         return None
 
-    model = MODEL_FACTORIES[model_name]()
-    model.fit(X, y)
-
+    model = _fit(build_model(model_name, horizon_days), X, y)
     if model_name in ("momentum", "ar"):
         return pd.Series(model.coef_, index=model.columns, name="coef").sort_values(key=np.abs, ascending=False)
     if model_name in LINEAR_MODELS:
-        coef = model[-1].coef_  # last pipeline step is the linear model
-        return pd.Series(coef, index=X.columns, name="standardized_coef").sort_values(key=np.abs, ascending=False)
+        return pd.Series(_coefficients(model, model_name), index=X.columns,
+                         name="standardized_coef").sort_values(key=np.abs, ascending=False)
     return pd.Series(model.feature_importances_, index=X.columns, name="importance").sort_values(ascending=False)
 
 
-def walk_forward_feature_importance(
+def walk_forward_coefficients(
     X: pd.DataFrame,
     y: pd.Series,
     horizon_days: int,
     model_name: ModelName = "ridge",
     min_train_size: int = 504,
+    test_step: int | None = None,
 ) -> pd.DataFrame:
-    """Refit at each walk-forward step (same schedule as walk_forward_validate)
-    and record *that step's* feature coefficients/importances, not just one
-    full-sample fit.
+    """Refit on the walk-forward schedule and record *each refit's*
+    coefficients, not just one full-sample fit.
 
-    A feature that looks important in a single full-sample fit_full_and_explain
-    call can still be pure noise: it just happened to correlate with the
-    target over that one particular stretch of history. Refitting at every
-    step and looking at how much a feature's weight jumps around (or
-    flips sign) across sub-periods is how you tell a time-stable
-    relationship from an artifact of which years happened to be in the
-    training set.
+    A feature that looks important in a single full-sample
+    fit_full_and_explain call can still be pure noise: it just happened to
+    correlate with the target over that one particular stretch of history.
+    How much its coefficient jumps around (or flips sign) across refits is
+    how you tell a time-stable relationship from an artifact of which years
+    happened to be in the training set.
+
+    Linear models only: tree models' feature_importances_ are unsigned
+    (always >= 0), so a sign-stability check on them would report a
+    perfectly stable direction no matter what.
     """
-    if model_name in ("zero_return", "historical_mean"):
-        raise ValueError(f"{model_name} has no per-feature coefficients to track")
+    if model_name not in LINEAR_MODELS:
+        raise ValueError(f"{model_name} has no signed per-feature coefficients to track")
 
-    build_model = MODEL_FACTORIES[model_name]
-    columns = MODEL_FACTORIES[model_name]().columns if model_name in ("momentum", "ar") else X.columns
-    n = len(X)
-
+    if model_name in ("momentum", "ar"):
+        columns = list(build_model(model_name, horizon_days).columns)
+    else:
+        columns = list(X.columns)
     rows, dates = [], []
-    i = min_train_size
-    while i < n:
-        train_end = i - horizon_days
-        model = build_model()
-        model.fit(X.iloc[:train_end], y.iloc[:train_end])
-        if model_name in ("momentum", "ar"):
-            rows.append(model.coef_)
-        elif model_name in LINEAR_MODELS:
-            rows.append(model[-1].coef_)
-        else:
-            rows.append(model.feature_importances_)
+    for i, train_end in _walk_forward_steps(len(X), horizon_days, min_train_size, test_step):
+        model = _fit(build_model(model_name, horizon_days), X.iloc[:train_end], y.iloc[:train_end])
+        rows.append(_coefficients(model, model_name))
         dates.append(X.index[i])
-        i += horizon_days
 
     return pd.DataFrame(rows, index=pd.DatetimeIndex(dates), columns=columns)
 
 
-def feature_stability_summary(importance_df: pd.DataFrame) -> pd.DataFrame:
+def feature_stability_summary(coefficients: pd.DataFrame) -> pd.DataFrame:
     """Per-feature stability across walk-forward refits.
 
-    sign_consistency: fraction of refits where the feature's coefficient
-    agrees in sign with its own across-refit mean. A feature with a large
-    mean importance but sign_consistency near 50% flipped direction
-    constantly -- that's the signature of fitting noise in whichever
-    period a given refit happened to see, not a real, usable effect.
+    sign_consistency: fraction of refits where the coefficient is nonzero
+    and agrees in sign with its own across-refit mean. A refit that zeroed
+    it (Lasso dropping the feature) counts as not agreeing, and a feature
+    that was never selected gets NaN rather than a vacuous 100%. A large
+    mean with sign_consistency near 50% means the feature flipped direction
+    constantly -- the signature of fitting noise in whichever period a
+    given refit happened to see, not a real, usable effect.
     """
-    mean = importance_df.mean()
-    std = importance_df.std()
+    mean = coefficients.mean()
+    std = coefficients.std()
     majority_sign = np.sign(mean)
-    sign_consistency = np.sign(importance_df).eq(majority_sign, axis=1).mean()
+    agrees = np.sign(coefficients).eq(majority_sign, axis=1) & coefficients.ne(0)
+    sign_consistency = agrees.mean().where(majority_sign != 0)
     out = pd.DataFrame({"mean": mean, "std": std, "sign_consistency": sign_consistency})
     return out.reindex(out["mean"].abs().sort_values(ascending=False).index)
 
@@ -365,14 +360,16 @@ def ablation_compare(
     """
     model_names = model_names or [n for n in MODEL_FACTORIES if n not in BASELINE_MODELS]
 
-    with_summary, _ = compare_models(X, y, horizon_days, min_train_size, model_names)
-    without_summary, _ = compare_models(X.drop(columns=drop_columns), y, horizon_days, min_train_size, model_names)
+    with_summary, _ = compare_models(X, y, horizon_days=horizon_days, min_train_size=min_train_size,
+                                     model_names=model_names)
+    without_summary, _ = compare_models(X.drop(columns=drop_columns), y, horizon_days=horizon_days,
+                                        min_train_size=min_train_size, model_names=model_names)
 
-    merged = with_summary.set_index("model")[["oos_r2_vs_naive", "directional_accuracy"]].join(
-        without_summary.set_index("model")[["oos_r2_vs_naive", "directional_accuracy"]],
-        lsuffix="_with", rsuffix="_without",
+    cols = ["oos_r2_vs_zero", "directional_accuracy"]
+    merged = with_summary.set_index("model")[cols].join(
+        without_summary.set_index("model")[cols], lsuffix="_with", rsuffix="_without",
     )
-    merged["oos_r2_delta"] = merged["oos_r2_vs_naive_with"] - merged["oos_r2_vs_naive_without"]
+    merged["oos_r2_delta"] = merged["oos_r2_vs_zero_with"] - merged["oos_r2_vs_zero_without"]
     return merged.sort_values("oos_r2_delta", ascending=False)
 
 
@@ -380,7 +377,7 @@ def ablation_compare(
 class EconomicSignificanceResult:
     model_name: str
     n_periods: int
-    n_position_changes: int
+    n_trades: int
     cost_bps: float
     strategy_total_return: float
     strategy_annualized_return: float
@@ -397,12 +394,13 @@ def economic_significance(
     """Turn walk-forward predictions into a P&L, not just a p-value.
 
     Rule: go long for the horizon_days block when the model predicts a
-    positive return, short when negative (sign(y_pred)); each position flip
-    pays a round-trip cost of 2*cost_bps (exit the old side, enter the new
-    one). A model can hit a "significant" directional-accuracy p-value and
-    still lose money once realistic costs eat the edge -- that's what this
-    checks, benchmarked against plain buy-and-hold over the same
-    out-of-sample stretch.
+    positive return, short when negative (sign(y_pred)). Each change in
+    position pays cost_bps per unit traded: entering from flat trades one
+    unit, flipping long <-> short trades two (exit the old side, enter the
+    new one). A model can hit a "significant" directional p-value and still
+    lose money once realistic costs eat the edge -- that's what this checks,
+    benchmarked against plain buy-and-hold over the same out-of-sample
+    stretch.
 
     Returns are log-returns, additive across the non-overlapping periods,
     so cumulative P&L is just their running sum; expm1 converts a summed
@@ -412,9 +410,8 @@ def economic_significance(
     gross_period_return = position * result.y_true
 
     position_prev = np.concatenate([[0.0], position[:-1]])
-    flipped = position != position_prev
-    cost_per_period = flipped * (cost_bps / 10_000) * 2
-    net_period_return = gross_period_return - cost_per_period
+    units_traded = np.abs(position - position_prev)
+    net_period_return = gross_period_return - units_traded * cost_bps / 10_000
 
     periods_per_year = TRADING_DAYS_PER_YEAR / horizon_days
 
@@ -429,13 +426,13 @@ def economic_significance(
     buy_hold_total, buy_hold_annualized, buy_hold_sharpe = _annualize(result.y_true)
 
     cum_log = np.cumsum(net_period_return)
-    running_max = np.maximum.accumulate(cum_log)
+    running_max = np.maximum.accumulate(np.concatenate([[0.0], cum_log]))[1:]
     max_drawdown = float(np.expm1(np.min(cum_log - running_max)))
 
     return EconomicSignificanceResult(
         model_name=result.model_name,
-        n_periods=result.n_predictions,
-        n_position_changes=int(np.sum(flipped)),
+        n_periods=len(result.y_true),
+        n_trades=int(np.sum(units_traded > 0)),
         cost_bps=cost_bps,
         strategy_total_return=strategy_total,
         strategy_annualized_return=strategy_annualized,
@@ -476,10 +473,10 @@ def label_regimes(prices: pd.Series, trend_window: int = 200, vol_window: int = 
 
 
 def regime_conditional_metrics(result: WalkForwardResult, regimes: pd.DataFrame, regime_column: str,
-                                min_n: int = 8) -> pd.DataFrame:
+                               min_n: int = 8) -> pd.DataFrame:
     """Slice an existing WalkForwardResult's predictions by regime label and
-    recompute OOS R^2 / directional accuracy / p-value within each bucket --
-    no refitting, just partitioning predictions that were already made.
+    recompute the forecast metrics within each bucket -- no refitting, just
+    partitioning predictions that were already made.
 
     Regimes with fewer than min_n test points are dropped rather than
     reported with a misleadingly precise-looking (and tiny-sample) metric.
@@ -487,9 +484,9 @@ def regime_conditional_metrics(result: WalkForwardResult, regimes: pd.DataFrame,
     labels = regimes.loc[result.dates, regime_column]
     rows = []
     for label in sorted(labels.dropna().unique()):
-        mask = (labels == label).values
+        mask = (labels == label).to_numpy()
         if mask.sum() < min_n:
             continue
-        metrics = _compute_metrics(result.y_pred[mask], result.y_true[mask])
+        metrics = forecast_metrics(result.y_pred[mask], result.y_true[mask], result.y_bench_mean[mask])
         rows.append({"model": result.model_name, "regime": label, **metrics})
     return pd.DataFrame(rows)

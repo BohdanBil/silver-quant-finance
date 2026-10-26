@@ -1,33 +1,36 @@
-"""Monte Carlo silver price forecast with VaR / CVaR risk metrics."""
+"""Monte Carlo silver price risk: simulated paths, VaR / CVaR, and an out-of-sample VaR backtest."""
 
 import argparse
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.ticker import FuncFormatter, MaxNLocator
 
-from data import (
-    GBMParams,
-    calibrate_gbm,
-    calibrate_gbm_bootstrap,
-    calibrate_gbm_ewma,
-    calibrate_gbm_garch,
-    fetch_silver_prices,
-    log_returns_of,
+from data import fetch_silver_prices, log_returns_of
+from plot_style import BLUE, BLUE_RAMP, INK, INK_SECONDARY, ORANGE, SURFACE, apply_style, thousands
+from risk import CoverageTest, rolling_var_backtest, var_cvar
+from risk_model import (
+    CALIBRATIONS,
+    DISTS,
+    PROCESS_MODELS,
+    CalibratedModel,
+    RiskModelSpec,
+    RollingForecaster,
+    calibrate,
+    simulate_paths,
 )
-from monte_carlo import simulate_gbm_jump_paths, simulate_gbm_paths
-from risk import backtest_var, var_cvar
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description=__doc__,
         epilog=(
-            "model x dist are independent axes: --model gbm --dist t reproduces a plain "
-            "fat-tailed GBM ('t' in the earlier sketch); --model gbm-jump adds Merton jumps "
-            "on top, with or without --dist t."
+            "--model and --dist are independent: --model gbm --dist t is a fat-tailed GBM; "
+            "--model gbm-jump adds Merton jumps estimated from the history, with or without --dist t."
         ),
     )
     p.add_argument("--period", default="5y", help="history window for calibration, e.g. 5y, 2y, 1y")
+    p.add_argument("--as-of", default=None, help="last date of data to use (YYYY-MM-DD); default: today")
     p.add_argument("--horizon-days", type=int, default=21, help="trading days to simulate forward")
     p.add_argument("--n-sims", type=int, default=20_000, help="number of Monte Carlo paths")
     p.add_argument("--position-oz", type=float, default=1000.0, help="position size in troy ounces")
@@ -36,84 +39,108 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out", default="silver_forecast.png", help="path to save the plot")
     p.add_argument("--no-show", action="store_true", help="save the plot but don't open a window")
 
-    p.add_argument("--calibration", choices=["point", "ewma", "garch", "bootstrap"], default="point",
-                    help="how to estimate mu/sigma from history (default: point = flat 5y mean/std)")
+    p.add_argument("--calibration", choices=CALIBRATIONS, default="point",
+                   help="how to estimate mu/sigma from history (default: point = flat mean/std over --period)")
     p.add_argument("--ewma-lambda", type=float, default=0.94, help="EWMA decay factor for --calibration ewma")
     p.add_argument("--block-size", type=int, default=21,
-                    help="block length (trading days) for --calibration bootstrap")
+                   help="block length (trading days) for --calibration bootstrap")
 
-    p.add_argument("--model", choices=["gbm", "gbm-jump"], default="gbm")
-    p.add_argument("--dist", choices=["normal", "t"], default="normal", help="innovation distribution")
+    p.add_argument("--model", choices=PROCESS_MODELS, default="gbm")
+    p.add_argument("--dist", choices=DISTS, default="normal", help="innovation distribution")
     p.add_argument("--t-df", type=float, default=5.0, help="degrees of freedom when --dist t")
     p.add_argument("--antithetic", action="store_true", help="use antithetic variates (variance reduction)")
+    p.add_argument("--jump-threshold", type=float, default=4.0,
+                   help="a daily return beyond this many local std devs counts as a jump (--model gbm-jump)")
 
-    p.add_argument("--jump-intensity", type=float, default=2.0, help="expected jumps/year (--model gbm-jump)")
-    p.add_argument("--jump-mean", type=float, default=-0.02, help="mean log jump size (--model gbm-jump)")
-    p.add_argument("--jump-std", type=float, default=0.05, help="std of log jump size (--model gbm-jump)")
-
+    p.add_argument("--backtest-window", type=int, default=504,
+                   help="rolling calibration window (trading days) for the out-of-sample VaR backtest")
+    p.add_argument("--backtest-sims", type=int, default=5_000, help="Monte Carlo paths per backtest date")
+    p.add_argument("--no-backtest", action="store_true", help="skip the out-of-sample VaR backtest")
     return p.parse_args()
 
 
-def calibrate(prices, args) -> GBMParams:
-    point = calibrate_gbm(prices)
-
-    if args.calibration == "point":
-        print(f"calibration      = point (flat {args.period} mean/std)")
-        return point
-
-    if args.calibration == "ewma":
-        params = calibrate_gbm_ewma(prices, lam=args.ewma_lambda)
-        print(f"calibration      = EWMA (lambda={args.ewma_lambda}) sigma, point mu")
-        print(f"  point sigma={point.sigma:.4%}  ->  EWMA sigma={params.sigma:.4%}")
-        return params
-
-    if args.calibration == "garch":
-        try:
-            params = calibrate_gbm_garch(prices)
-        except RuntimeError as e:
-            print(f"  GARCH(1,1) fit failed ({e}); falling back to EWMA")
-            return calibrate_gbm_ewma(prices, lam=args.ewma_lambda)
-        print(f"calibration      = GARCH(1,1) sigma, point mu")
-        print(f"  point sigma={point.sigma:.4%}  ->  GARCH sigma={params.sigma:.4%}")
-        return params
-
-    # bootstrap: one (mu, sigma) draw per simulated path, so parameter
-    # uncertainty (mu especially) is baked into the terminal distribution
-    # instead of collapsed to a single number.
-    boot = calibrate_gbm_bootstrap(prices, n_boot=args.n_sims, block_size=args.block_size, seed=args.seed)
-    print(f"calibration      = block bootstrap ({args.n_sims:,} draws, block={args.block_size}d)")
-    print(f"  mu:    point={point.mu:.4%}  bootstrap mean={boot['mu'].mean():.4%}  "
-          f"std={boot['mu'].std():.4%}  5-95pct=[{boot['mu'].quantile(.05):.4%}, {boot['mu'].quantile(.95):.4%}]")
-    print(f"  sigma: point={point.sigma:.4%}  bootstrap mean={boot['sigma'].mean():.4%}  "
-          f"std={boot['sigma'].std():.4%}")
-    return GBMParams(s0=point.s0, mu=boot["mu"].values, sigma=boot["sigma"].values)
+def spec_from_args(args: argparse.Namespace) -> RiskModelSpec:
+    return RiskModelSpec(calibration=args.calibration, model=args.model, dist=args.dist, t_df=args.t_df,
+                         ewma_lambda=args.ewma_lambda, block_size=args.block_size,
+                         jump_threshold=args.jump_threshold)
 
 
-def simulate(params: GBMParams, args) -> np.ndarray:
-    if args.model == "gbm":
-        return simulate_gbm_paths(
-            params, args.horizon_days, args.n_sims,
-            dist=args.dist, t_df=args.t_df, antithetic=args.antithetic, seed=args.seed,
-        )
-    return simulate_gbm_jump_paths(
-        params, args.horizon_days, args.n_sims,
-        jump_intensity=args.jump_intensity, jump_mean=args.jump_mean, jump_std=args.jump_std,
-        dist=args.dist, t_df=args.t_df, antithetic=args.antithetic, seed=args.seed,
+def describe_calibration(model: CalibratedModel, args: argparse.Namespace) -> None:
+    params = model.params
+    method = {
+        "point": f"point (flat {args.period} mean/std)",
+        "ewma": f"EWMA sigma (lambda={args.ewma_lambda})",
+        "garch": f"GARCH(1,1) sigma, averaged over the {args.horizon_days}d horizon",
+        "bootstrap": f"block bootstrap ({args.n_sims:,} draws, block={args.block_size}d)",
+    }[args.calibration]
+    print(f"calibration      = {method}")
+    for note in model.notes:
+        print(f"  {note}")
+
+    if model.jumps is not None:
+        j = model.jumps
+        print(f"  jumps: {j.n_detected} detected ({j.intensity:.1f}/yr), mean log size {j.mean:+.2%}, "
+              f"std {j.std:.2%}; sigma below is the diffusion vol with those days removed")
+
+    if np.ndim(params.sigma) == 0:
+        if args.calibration in ("ewma", "garch"):
+            print(f"  sigma: flat={model.point_sigma:.2%}  ->  {args.calibration}={params.sigma:.2%}")
+        else:
+            print(f"  sigma: {params.sigma:.2%}")
+        print(f"  mu (expected annual return): {params.mu:+.2%}")
+    else:
+        mu, sigma = np.asarray(params.mu), np.asarray(params.sigma)
+        print(f"  mu:    mean={mu.mean():+.2%}  std={mu.std():.2%}  "
+              f"5-95pct=[{np.quantile(mu, .05):+.2%}, {np.quantile(mu, .95):+.2%}]")
+        print(f"  sigma: mean={sigma.mean():.2%}  std={sigma.std():.2%}  (flat: {model.point_sigma:.2%})")
+
+
+def print_backtest(title: str, results: dict[float, CoverageTest]) -> None:
+    print(title)
+    for c, bt in results.items():
+        print(f"    {c:.0%}: {bt.n_exceptions}/{bt.n_obs} exceptions ({bt.exception_rate:.2%} vs "
+              f"{bt.expected_rate:.2%} expected)  Kupiec p={bt.kupiec_pvalue:.3f}  "
+              f"clustering p={bt.independence_pvalue:.3f}  -> {bt.verdict}")
+
+
+def run_backtests(prices, spec: RiskModelSpec, args: argparse.Namespace) -> None:
+    window = args.backtest_window
+    if len(prices) <= window + args.horizon_days:
+        print(f"\n(skipping backtest: need more than {window + args.horizon_days} prices, have {len(prices)})")
+        return
+
+    print(f"\nOut-of-sample VaR backtest -- each forecast calibrated on the {window} trading days before it "
+          f"and nothing later; losses in % of position value:")
+    one_day = rolling_var_backtest(
+        prices, RollingForecaster(spec, 1, args.backtest_sims, window, seed=args.seed),
+        horizon_days=1, confidence_levels=args.confidence, min_history=window,
     )
+    print_backtest("  1-day VaR of the same model, every day:", one_day)
+
+    if args.horizon_days > 1:
+        h_day = rolling_var_backtest(
+            prices, RollingForecaster(spec, args.horizon_days, args.backtest_sims, window, seed=args.seed),
+            horizon_days=args.horizon_days, confidence_levels=args.confidence, min_history=window,
+        )
+        n_windows = next(iter(h_day.values())).n_obs
+        expected_99 = n_windows * (1 - max(args.confidence))
+        print_backtest(f"  {args.horizon_days}-day VaR, non-overlapping windows "
+                       f"(low power: ~{expected_99:.1f} exceptions expected at {max(args.confidence):.0%}):", h_day)
 
 
 def main() -> None:
     args = parse_args()
+    spec = spec_from_args(args)
 
-    prices = fetch_silver_prices(period=args.period)
-    print(f"Calibrated from {len(prices)} daily prices")
-    params = calibrate(prices, args)
-    s0 = params.s0
-    print(f"  spot (s0) = {s0:.4f}")
+    prices = fetch_silver_prices(period=args.period, as_of=args.as_of)
+    print(f"Calibrated from {len(prices)} daily prices, {prices.index[0].date()} to {prices.index[-1].date()}")
+    model = calibrate(prices, spec, horizon_days=args.horizon_days, n_sims=args.n_sims, seed=args.seed)
+    describe_calibration(model, args)
+    s0 = model.params.s0
+    print(f"  price (s0) = {s0:.4f}  (front-month futures)")
 
-    print(f"\nmodel = {args.model}, dist = {args.dist}" + (f" (df={args.t_df})" if args.dist == "t" else "")
-          + (f", antithetic" if args.antithetic else ""))
-    paths = simulate(params, args)
+    print(f"\nmodel = {spec.label}" + (", antithetic" if args.antithetic else ""))
+    paths = simulate_paths(model, args.horizon_days, args.n_sims, antithetic=args.antithetic, seed=args.seed)
     terminal_prices = paths[:, -1]
 
     pnl = (terminal_prices - s0) * args.position_oz
@@ -123,55 +150,56 @@ def main() -> None:
           f"{np.percentile(terminal_prices, 95):.4f}")
 
     daily_returns = log_returns_of(prices)
-    worst_daily_log_move = float(daily_returns.min())
-    worst_daily_simple_move = np.exp(worst_daily_log_move) - 1
+    worst_daily_simple_move = np.exp(float(daily_returns.min())) - 1
     worst_daily_pnl = s0 * worst_daily_simple_move * args.position_oz
     frac_worse = float(np.mean(pnl < worst_daily_pnl))
     print(f"\nSanity check: worst historical 1-day move over {args.period} was {worst_daily_simple_move:.2%} "
-          f"(${-worst_daily_pnl:,.0f} on this position).")
+          f"(${-worst_daily_pnl:,.0f} on this position at today's price).")
     print(f"  {frac_worse:.2%} of simulated {args.horizon_days}-day outcomes lose more than that "
           f"single worst historical day.")
 
-    print(f"\nRisk metrics on a {args.position_oz:,.0f} oz long position:")
+    notional = s0 * args.position_oz
+    print(f"\nRisk metrics on a {args.position_oz:,.0f} oz long position (${notional:,.0f}):")
     for c in args.confidence:
         metrics = var_cvar(pnl, confidence=c)
-        print(f"  {c:.0%} VaR  = ${metrics.var:,.2f}")
-        print(f"  {c:.0%} CVaR = ${metrics.cvar:,.2f}")
+        print(f"  {c:.0%} VaR  = ${metrics.var:,.2f}  ({metrics.var / notional:.2%})")
+        print(f"  {c:.0%} CVaR = ${metrics.cvar:,.2f}  ({metrics.cvar / notional:.2%})")
 
-        bt = backtest_var(prices, var_threshold=metrics.var, position_oz=args.position_oz,
-                           horizon_days=args.horizon_days, confidence=c)
-        verdict = "REJECTED (miscalibrated)" if bt.reject_at_5pct else "not rejected"
-        print(f"    backtest: {bt.n_exceptions}/{bt.n_obs} historical windows breached VaR "
-              f"({bt.exception_rate:.2%} vs {bt.expected_rate:.2%} expected), "
-              f"Kupiec p={bt.p_value:.4f} -> {verdict}")
+    if not args.no_backtest:
+        run_backtests(prices, spec, args)
 
-    plot_results(paths, pnl, args)
+    plot_results(paths, pnl, spec, args)
 
 
-def plot_results(paths, pnl, args) -> None:
-    fig, (ax_paths, ax_hist) = plt.subplots(1, 2, figsize=(13, 5))
+def plot_results(paths: np.ndarray, pnl: np.ndarray, spec: RiskModelSpec, args: argparse.Namespace) -> None:
+    apply_style()
+    fig, (ax_fan, ax_hist) = plt.subplots(1, 2, figsize=(12, 4.6))
 
-    n_show = min(200, paths.shape[0])
-    ax_paths.plot(paths[:n_show].T, linewidth=0.5, alpha=0.3, color="tab:blue")
-    ax_paths.plot(paths.mean(axis=0), linewidth=2, color="black", label="mean path")
-    ax_paths.set_title(f"Simulated silver price paths ({args.horizon_days}d)")
-    ax_paths.set_xlabel("trading day")
-    ax_paths.set_ylabel("price")
-    ax_paths.legend()
+    days = np.arange(paths.shape[1])
+    q05, q25, q50, q75, q95 = np.percentile(paths, [5, 25, 50, 75, 95], axis=0)
+    ax_fan.fill_between(days, q05, q95, color=BLUE_RAMP[100], linewidth=0, label="5-95% of paths")
+    ax_fan.fill_between(days, q25, q75, color=BLUE_RAMP[250], linewidth=0, label="25-75%")
+    ax_fan.plot(days, q50, color=BLUE_RAMP[600], linewidth=2, label="median")
+    ax_fan.set_title(f"Simulated silver price, next {args.horizon_days} trading days", loc="left")
+    ax_fan.set_xlabel("trading days ahead")
+    ax_fan.set_ylabel("price ($/oz)")
+    ax_fan.set_xlim(0, days[-1])
+    ax_fan.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax_fan.legend(loc="upper left")
 
-    ax_hist.hist(pnl, bins=80, color="tab:blue", alpha=0.7)
-    for c in args.confidence:
+    ax_hist.hist(pnl, bins=80, color=BLUE, edgecolor=SURFACE, linewidth=0.5)
+    for c, color in zip(sorted(args.confidence), (ORANGE, INK, INK_SECONDARY)):
         metrics = var_cvar(pnl, confidence=c)
-        ax_hist.axvline(-metrics.var, color="tab:red", linestyle="--",
-                         label=f"{c:.0%} VaR = ${metrics.var:,.0f}")
-        ax_hist.axvline(-metrics.cvar, color="tab:orange", linestyle=":",
-                         label=f"{c:.0%} CVaR = ${metrics.cvar:,.0f}")
-    ax_hist.set_title(f"P&L distribution ({args.position_oz:,.0f} oz position)")
+        ax_hist.axvline(-metrics.var, color=color, linewidth=1.5,
+                        label=f"{c:.0%} VaR ${metrics.var:,.0f}  (CVaR ${metrics.cvar:,.0f})")
+    ax_hist.set_title(f"{args.horizon_days}-day P&L, {args.position_oz:,.0f} oz long", loc="left")
     ax_hist.set_xlabel("P&L ($)")
-    ax_hist.legend(fontsize=8)
+    ax_hist.set_ylabel("simulated paths")
+    ax_hist.xaxis.set_major_formatter(FuncFormatter(thousands))
+    ax_hist.legend(loc="upper right")
 
-    dist_label = args.dist if args.dist == "normal" else f"{args.dist} (df={args.t_df})"
-    fig.suptitle(f"model={args.model}  dist={dist_label}  calibration={args.calibration}", fontsize=10)
+    fig.suptitle(f"model: {spec.label}   calibration window: {args.period}", fontsize=9, color=INK_SECONDARY,
+                 x=0.99, ha="right")
     fig.tight_layout()
     fig.savefig(args.out, dpi=150)
     print(f"\nSaved plot to {args.out}")

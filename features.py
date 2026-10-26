@@ -3,7 +3,7 @@
 import numpy as np
 import pandas as pd
 
-TRADING_DAYS_PER_YEAR = 252
+from data import TRADING_DAYS_PER_YEAR
 
 
 def _log_ret(s: pd.Series, periods: int) -> pd.Series:
