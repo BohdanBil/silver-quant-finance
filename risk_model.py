@@ -5,8 +5,9 @@ shared by main.py (one forecast from today) and the rolling VaR backtest
 (one forecast per historical date, each from only the data available then).
 """
 
+import itertools
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Callable, Literal, Sequence
 
 import numpy as np
 import pandas as pd
@@ -25,6 +26,7 @@ from data import (
     log_returns_of,
 )
 from monte_carlo import Dist, simulate_gbm_jump_paths, simulate_gbm_paths
+from risk import CoverageTest, rolling_var_backtest
 
 Calibration = Literal["point", "ewma", "garch", "bootstrap"]
 ProcessModel = Literal["gbm", "gbm-jump"]
@@ -176,3 +178,53 @@ class RollingForecaster:
         paths = simulate_paths(model, self.horizon_days, self.n_sims, seed=self.seed + self._calls)
         self._calls += 1
         return paths[:, -1] / paths[:, 0] - 1
+
+
+def backtest_spec(
+    prices: pd.Series,
+    spec: RiskModelSpec,
+    horizon_days: int,
+    confidence_levels: Sequence[float],
+    window: int = 504,
+    n_sims: int = 5_000,
+    refit_every: int = 21,
+    seed: int = 0,
+) -> dict[float, CoverageTest]:
+    """Rolling out-of-sample VaR backtest of one model variant (see risk.rolling_var_backtest)."""
+    forecaster = RollingForecaster(spec, horizon_days, n_sims, window, refit_every=refit_every, seed=seed)
+    return rolling_var_backtest(prices, forecaster, horizon_days, confidence_levels, min_history=window)
+
+
+def all_specs(calibrations: Sequence[Calibration] = CALIBRATIONS, models: Sequence[ProcessModel] = PROCESS_MODELS,
+              dists: Sequence[Dist] = DISTS, t_df: float = 5.0) -> list[RiskModelSpec]:
+    return [RiskModelSpec(calibration=c, model=m, dist=d, t_df=t_df)
+            for c, m, d in itertools.product(calibrations, models, dists)]
+
+
+def backtest_variants(
+    prices: pd.Series,
+    specs: Sequence[RiskModelSpec],
+    horizon_days: int,
+    confidence_levels: Sequence[float],
+    window: int = 504,
+    n_sims: int = 5_000,
+    refit_every: int = 21,
+    seed: int = 0,
+    on_result: Callable[[RiskModelSpec, dict[float, CoverageTest]], None] | None = None,
+) -> pd.DataFrame:
+    """backtest_spec for every variant, one row each, with per-confidence columns."""
+    rows = []
+    for spec in specs:
+        results = backtest_spec(prices, spec, horizon_days, confidence_levels, window, n_sims, refit_every, seed)
+        if on_result is not None:
+            on_result(spec, results)
+        row = {"model": spec.label, "calibration": spec.calibration, "process": spec.model, "dist": spec.dist}
+        for c, bt in results.items():
+            row[f"exceptions_{c:.0%}"] = bt.n_exceptions
+            row[f"rate_{c:.0%}"] = bt.exception_rate
+            row[f"kupiec_p_{c:.0%}"] = bt.kupiec_pvalue
+            row[f"cluster_p_{c:.0%}"] = bt.independence_pvalue
+            row[f"rejected_{c:.0%}"] = bt.rejected
+            row[f"verdict_{c:.0%}"] = bt.verdict
+        rows.append(row)
+    return pd.DataFrame(rows)

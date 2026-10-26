@@ -25,47 +25,86 @@ import pandas as pd
 from data import fetch_silver_prices
 from features import engineer_features
 from forecast_data import build_feature_frame
-from forecast_model import MODEL_FACTORIES, compare_models, label_regimes, regime_conditional_metrics
+from forecast_model import (
+    MODEL_FACTORIES,
+    WalkForwardResult,
+    compare_models,
+    label_regimes,
+    largest_contribution,
+    regime_conditional_metrics,
+)
 from plot_style import DIVERGING, INK, MUTED, SURFACE, apply_style
 from significance import benjamini_hochberg, bonferroni, holm
 
 HORIZONS = [1, 5, 21, 63]
 TARGET_TEST_POINTS = 100  # cap refits for short horizons; leaves 21d/63d at their natural (larger) step
 TESTS = {"cw_pvalue": "Clark-West (beats random walk)", "pt_pvalue": "Pesaran-Timmermann (direction)"}
+ADJUSTMENTS = {"Bonferroni": bonferroni, "Holm": holm, "BH": benjamini_hochberg}
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--period", default="10y", help="history window -- longer is better here for regime variety")
-    p.add_argument("--as-of", default=None, help="last date of data to use (YYYY-MM-DD); default: today")
-    p.add_argument("--horizons", type=int, nargs="+", default=HORIZONS)
-    p.add_argument("--regime-horizon", type=int, default=21, help="which horizon's predictions to slice by regime")
-    p.add_argument("--min-train-size", type=int, default=504)
-    p.add_argument("--min-regime-n", type=int, default=8, help="drop regime buckets with fewer test points than this")
-    p.add_argument("--plot", default=None, help="save a heatmap of OOS R^2 by model x horizon to this path")
-    return p.parse_args()
+def horizon_sweep(frame: pd.DataFrame, horizons: list[int], min_train_size: int = 504,
+                  model_names: list[str] | None = None,
+                  ) -> tuple[pd.DataFrame, dict[int, dict[str, WalkForwardResult]]]:
+    """compare_models at every horizon; returns (one row per model x horizon, results by horizon)."""
+    model_names = model_names or list(MODEL_FACTORIES.keys())
+    rows, results_by_horizon = [], {}
+    for h in horizons:
+        X, y = engineer_features(frame, horizon_days=h)
+        test_step = max(h, -(-(len(X) - min_train_size) // TARGET_TEST_POINTS))  # ceil div
+        summary, results = compare_models(X, y, horizon_days=h, min_train_size=min_train_size,
+                                          model_names=model_names, test_step=test_step)
+        results_by_horizon[h] = results
+        summary.insert(0, "horizon_days", h)
+        summary["test_step"] = test_step
+        rows.append(summary)
+    return pd.concat(rows, ignore_index=True), results_by_horizon
 
 
-def report_family(df: pd.DataFrame, id_columns: list[str], family_name: str) -> int:
-    """Print raw and adjusted significance counts for each test over one family of cells.
+def regime_breakdown(prices: pd.Series, results: dict[str, WalkForwardResult], min_n: int = 8) -> pd.DataFrame:
+    """Per-model metrics within each trend and vol regime, reusing already-made predictions."""
+    regimes = label_regimes(prices)
+    rows = [regime_conditional_metrics(result, regimes, col, min_n=min_n)
+            for result in results.values() for col in ("trend_regime", "vol_regime")]
+    return pd.concat([r for r in rows if not r.empty], ignore_index=True)
+
+
+def adjusted_pvalues(df: pd.DataFrame) -> pd.DataFrame:
+    """Add <test>_<adjustment> columns, each test adjusted across all the rows of `df` as one family."""
+    out = df.copy()
+    for col in TESTS:
+        for name, adjust in ADJUSTMENTS.items():
+            out[f"{col}_{name.lower()}"] = adjust(df[col].to_numpy())
+    return out
+
+
+def significance_counts(df: pd.DataFrame) -> dict[str, dict[str, int]]:
+    """For each test: testable cells, raw p<0.05, and p<0.05 after each adjustment (df from adjusted_pvalues)."""
+    counts = {}
+    for col in TESTS:
+        p = df[col].to_numpy()
+        counts[col] = {"testable": int(np.sum(~np.isnan(p))), "raw": int(np.sum(p < 0.05))}
+        for name in ADJUSTMENTS:
+            counts[col][name] = int(np.sum(df[f"{col}_{name.lower()}"].to_numpy() < 0.05))
+    return counts
+
+
+def report_family(df: pd.DataFrame, id_columns: list[str]) -> int:
+    """Print raw and adjusted significance counts for one family of cells (df from adjusted_pvalues).
 
     Returns how many (cell, test) pairs survive Holm or Benjamini-Hochberg.
     """
+    counts = significance_counts(df)
     survivors = 0
     for col, test_name in TESTS.items():
-        p = df[col].to_numpy()
-        m = int(np.sum(~np.isnan(p)))
-        adjusted = {"Bonferroni": bonferroni(p), "Holm": holm(p), "BH": benjamini_hochberg(p)}
-        counts = "  ".join(f"{name} {int(np.sum(a < 0.05))}" for name, a in adjusted.items())
-        print(f"  {test_name}: {m} testable {family_name} -- p<0.05 raw {int(np.sum(p < 0.05))}  |  "
-              f"after adjustment: {counts}")
-        raw_hits = df[p < 0.05]
+        c = counts[col]
+        adjusted = "  ".join(f"{name} {c[name]}" for name in ADJUSTMENTS)
+        print(f"  {test_name}: {c['testable']} testable cells -- p<0.05 raw {c['raw']}  |  "
+              f"after adjustment: {adjusted}")
+        raw_hits = df[df[col] < 0.05]
         if not raw_hits.empty:
-            shown = raw_hits[id_columns + [col]].copy()
-            shown["holm"] = adjusted["Holm"][p < 0.05]
-            shown["bh"] = adjusted["BH"][p < 0.05]
+            shown = raw_hits[id_columns + [col, f"{col}_holm", f"{col}_bh"]]
             print("    " + shown.to_string(index=False, float_format="{:.4f}".format).replace("\n", "\n    "))
-        survivors += int(np.sum((adjusted["Holm"] < 0.05) | (adjusted["BH"] < 0.05)))
+        survivors += int(np.sum((df[f"{col}_holm"] < 0.05) | (df[f"{col}_bh"] < 0.05)))
     return survivors
 
 
@@ -96,6 +135,18 @@ def plot_heatmap(pivot: pd.DataFrame, path: str) -> None:
     print(f"\nSaved heatmap to {path}")
 
 
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--period", default="10y", help="history window -- longer is better here for regime variety")
+    p.add_argument("--as-of", default=None, help="last date of data to use (YYYY-MM-DD); default: today")
+    p.add_argument("--horizons", type=int, nargs="+", default=HORIZONS)
+    p.add_argument("--regime-horizon", type=int, default=21, help="which horizon's predictions to slice by regime")
+    p.add_argument("--min-train-size", type=int, default=504)
+    p.add_argument("--min-regime-n", type=int, default=8, help="drop regime buckets with fewer test points than this")
+    p.add_argument("--plot", default=None, help="save a heatmap of OOS R^2 by model x horizon to this path")
+    return p.parse_args()
+
+
 def main() -> None:
     args = parse_args()
 
@@ -105,27 +156,15 @@ def main() -> None:
           f"({prices.index[0].date()} to {prices.index[-1].date()}), merged feature frame: {frame.shape[0]} rows")
 
     model_names = list(MODEL_FACTORIES.keys())
-
     print(f"\n=== Horizon sweep: {args.horizons} ===")
-    sweep_rows = []
-    results_by_horizon = {}
+    sweep, results_by_horizon = horizon_sweep(frame, args.horizons, args.min_train_size, model_names)
+    sweep = adjusted_pvalues(sweep)
     for h in args.horizons:
-        X, y = engineer_features(frame, horizon_days=h)
-        test_step = max(h, -(-(len(X) - args.min_train_size) // TARGET_TEST_POINTS))  # ceil div
-        summary, results = compare_models(
-            X, y, horizon_days=h, min_train_size=args.min_train_size,
-            model_names=model_names, test_step=test_step,
-        )
-        results_by_horizon[h] = results
-        summary.insert(0, "horizon_days", h)
-        sweep_rows.append(summary)
-        print(f"  horizon={h:>3d}d: {summary['n_predictions'].iloc[0]} test points (test_step={test_step})")
-
-    sweep = pd.concat(sweep_rows, ignore_index=True)
+        row = sweep[sweep["horizon_days"] == h].iloc[0]
+        print(f"  horizon={h:>3d}d: {row['n_predictions']} test points (test_step={row['test_step']})")
 
     print("\nOOS R^2 vs random walk, by model x horizon:")
-    pivot_r2 = sweep.pivot(index="model", columns="horizon_days", values="oos_r2_vs_zero")
-    pivot_r2 = pivot_r2.loc[model_names]
+    pivot_r2 = sweep.pivot(index="model", columns="horizon_days", values="oos_r2_vs_zero").loc[model_names]
     print(pivot_r2.to_string(float_format="{:+.4f}".format))
 
     print("\nOOS R^2 vs historical mean, by model x horizon:")
@@ -144,28 +183,30 @@ def main() -> None:
               f"dir_acc={best['directional_accuracy']:.1%}  CW p={best['cw_pvalue']:.3f}  "
               f"PT p={best['pt_pvalue']:.3f}")
 
+    print("\nHow much of each positive OOS R^2 comes from a single test point:")
+    for _, row in sweep[sweep["oos_r2_vs_zero"] > 0.005].iterrows():
+        top = largest_contribution(results_by_horizon[row["horizon_days"]][row["model"]])
+        print(f"  {row['horizon_days']:>3d}d {row['model']:<16} R2={row['oos_r2_vs_zero']:+.4f}: "
+              f"{top['share_of_gain']:.0%} from {top['date'].date()} (actual {np.expm1(top['actual']):+.2%}); "
+              f"R2 without it {top['oos_r2_without']:+.4f}")
+
     print(f"\nSignificance across the {len(sweep)} (model, horizon) cells:")
-    sweep_survivors = report_family(sweep, ["horizon_days", "model"], "cells")
+    sweep_survivors = report_family(sweep, ["horizon_days", "model"])
 
     # --- regime breakdown, reusing the already-computed regime_horizon results (no refitting) ---
     print(f"\n=== Regime breakdown at horizon={args.regime_horizon}d (reusing the sweep's predictions) ===")
-    if args.regime_horizon not in results_by_horizon:
+    if args.regime_horizon in results_by_horizon:
+        regime_results = results_by_horizon[args.regime_horizon]
+    else:
         X, y = engineer_features(frame, horizon_days=args.regime_horizon)
         _, regime_results = compare_models(X, y, horizon_days=args.regime_horizon,
                                            min_train_size=args.min_train_size, model_names=model_names)
-    else:
-        regime_results = results_by_horizon[args.regime_horizon]
-
-    regimes = label_regimes(prices)
-    regime_rows = []
-    for result in regime_results.values():
-        for col in ("trend_regime", "vol_regime"):
-            regime_rows.append(regime_conditional_metrics(result, regimes, col, min_n=args.min_regime_n))
-    regime_df = pd.concat([r for r in regime_rows if not r.empty], ignore_index=True)
+    regime_df = adjusted_pvalues(regime_breakdown(prices, regime_results, min_n=args.min_regime_n))
 
     print("\nPer-regime metrics (only buckets with "
           f">= {args.min_regime_n} test points shown):")
-    print(regime_df.to_string(index=False, na_rep="n/a", formatters={
+    print(regime_df[["model", "regime", "n_predictions", "oos_r2_vs_zero", "oos_r2_vs_mean", "cw_pvalue",
+                     "directional_accuracy", "pt_pvalue"]].to_string(index=False, na_rep="n/a", formatters={
         "oos_r2_vs_zero": "{:+.4f}".format,
         "oos_r2_vs_mean": "{:+.4f}".format,
         "cw_pvalue": "{:.4f}".format,
@@ -176,7 +217,7 @@ def main() -> None:
     beats_in_regime = regime_df[regime_df["oos_r2_vs_zero"] > 0]
     print(f"\n  -> {len(beats_in_regime)}/{len(regime_df)} (model, regime) combos beat random walk within that regime")
     print(f"Significance across the {len(regime_df)} (model, regime) cells:")
-    regime_survivors = report_family(regime_df, ["regime", "model"], "cells")
+    regime_survivors = report_family(regime_df, ["regime", "model"])
 
     print("\n=== Verdict ===")
     if sweep_survivors == 0 and regime_survivors == 0:

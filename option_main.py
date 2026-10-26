@@ -7,12 +7,61 @@ overridden.
 """
 
 import argparse
+from dataclasses import dataclass
+
+import pandas as pd
 
 from data import TRADING_DAYS_PER_YEAR, fetch_silver_prices, fit_garch11, garch11_term_volatility, log_returns_of
 from forecast_data import fetch_fred_series
-from option_pricing import monte_carlo_option_price, option_greeks, option_price
+from option_pricing import Greeks, MonteCarloPriceResult, monte_carlo_option_price, option_greeks, option_price
 
 RISK_FREE_SERIES = "DGS3MO"  # 3-month T-bill: a reasonable proxy for a near-term risk-free rate
+VARIANCE_REDUCTION_SETTINGS = [("plain", False, False), ("antithetic", True, False),
+                               ("control variate", False, True), ("both", True, True)]
+
+
+@dataclass
+class OptionReport:
+    option_type: str
+    futures_price: float
+    strike: float
+    rate: float
+    sigma: float
+    maturity_days: int
+    T: float
+    price: float  # Black-76
+    greeks: Greeks
+    bs_as_spot: float  # Black-Scholes treating the futures price as a spot price, for comparison
+    mc: MonteCarloPriceResult
+    variance_reduction: dict[str, MonteCarloPriceResult]  # same paths and seed, each setting
+
+
+def default_inputs(prices: pd.Series, maturity_days: int, as_of: str | None = None) -> tuple[float, float]:
+    """(GARCH(1,1) vol averaged to expiry, latest 3-month T-bill rate)."""
+    r_hist = log_returns_of(prices).to_numpy()
+    sigma = garch11_term_volatility(r_hist, fit_garch11(r_hist), horizon_days=maturity_days)
+    rate = float(fetch_fred_series(RISK_FREE_SERIES, as_of=as_of).iloc[-1]) / 100
+    return sigma, rate
+
+
+def price_silver_option(futures_price: float, strike: float, rate: float, sigma: float, maturity_days: int,
+                        option_type: str = "call", n_sims: int = 200_000, seed: int = 42,
+                        antithetic: bool = True, control_variate: bool = True) -> OptionReport:
+    T = maturity_days / TRADING_DAYS_PER_YEAR
+    common = dict(s=futures_price, k=strike, r=rate, sigma=sigma, T=T, option_type=option_type)
+    mc_common = dict(common, n_sims=n_sims, underlying="futures", seed=seed)
+    return OptionReport(
+        option_type=option_type, futures_price=futures_price, strike=strike, rate=rate, sigma=sigma,
+        maturity_days=maturity_days, T=T,
+        price=option_price(**common, underlying="futures"),
+        greeks=option_greeks(**common, underlying="futures"),
+        bs_as_spot=option_price(**common, underlying="spot"),
+        mc=monte_carlo_option_price(**mc_common, antithetic=antithetic, control_variate=control_variate),
+        variance_reduction={
+            label: monte_carlo_option_price(**mc_common, antithetic=anti, control_variate=cv)
+            for label, anti, cv in VARIANCE_REDUCTION_SETTINGS
+        },
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,45 +87,34 @@ def main() -> None:
 
     prices = fetch_silver_prices(period=args.period, as_of=args.as_of)
     f0 = float(prices.iloc[-1])
-    if args.sigma is not None:
-        sigma = args.sigma
-    else:
-        r_hist = log_returns_of(prices).to_numpy()
-        sigma = garch11_term_volatility(r_hist, fit_garch11(r_hist), horizon_days=args.maturity_days)
-    strike = args.strike if args.strike is not None else f0
+    default_sigma, default_rate = default_inputs(prices, args.maturity_days, args.as_of)
+    report = price_silver_option(
+        f0,
+        strike=args.strike if args.strike is not None else f0,
+        rate=args.rate if args.rate is not None else default_rate,
+        sigma=args.sigma if args.sigma is not None else default_sigma,
+        maturity_days=args.maturity_days, option_type=args.option_type, n_sims=args.n_sims, seed=args.seed,
+        antithetic=not args.no_antithetic, control_variate=not args.no_control_variate,
+    )
 
-    if args.rate is not None:
-        r = args.rate
-    else:
-        r = float(fetch_fred_series(RISK_FREE_SERIES, as_of=args.as_of).iloc[-1]) / 100
-
-    T = args.maturity_days / TRADING_DAYS_PER_YEAR
-    kind = args.option_type
-
-    print(f"Silver futures {kind} ({prices.index[-1].date()}): F=${f0:.4f}  K=${strike:.4f}  "
-          f"r={r:.3%}  sigma={sigma:.2%}  T={T:.3f}y ({args.maturity_days} trading days)")
+    print(f"Silver futures {report.option_type} ({prices.index[-1].date()}): F=${f0:.4f}  K=${report.strike:.4f}  "
+          f"r={report.rate:.3%}  sigma={report.sigma:.2%}  T={report.T:.3f}y ({args.maturity_days} trading days)")
     print("  F is the front-month COMEX price; listed options are on a specific contract month, so this "
           "treats the front month as that contract.")
     print("  sigma is a GARCH(1,1) forecast averaged over the option's life, a stand-in for implied vol -- "
           "no options chain is wired in to pull real implied vol from.")
 
-    price = option_price(f0, strike, r, sigma, T, option_type=kind, underlying="futures")
-    greeks = option_greeks(f0, strike, r, sigma, T, option_type=kind, underlying="futures")
-    bs_as_spot = option_price(f0, strike, r, sigma, T, option_type=kind, underlying="spot")
+    g = report.greeks
+    print(f"\nBlack-76 price = ${report.price:.4f}")
+    print(f"  delta={g.delta:+.4f}  gamma={g.gamma:.4f}  "
+          f"vega={g.vega / 100:.4f} (per 1 vol pt)  "
+          f"theta={g.theta / TRADING_DAYS_PER_YEAR:.4f} (per trading day)  "
+          f"rho={g.rho / 100:.4f} (per 1% rate move)")
+    print(f"  (Black-Scholes, wrongly treating F as a spot price, would say ${report.bs_as_spot:.4f}: "
+          f"{report.bs_as_spot / report.price - 1:+.1%})")
 
-    print(f"\nBlack-76 price = ${price:.4f}")
-    print(f"  delta={greeks.delta:+.4f}  gamma={greeks.gamma:.4f}  "
-          f"vega={greeks.vega / 100:.4f} (per 1 vol pt)  "
-          f"theta={greeks.theta / TRADING_DAYS_PER_YEAR:.4f} (per trading day)  "
-          f"rho={greeks.rho / 100:.4f} (per 1% rate move)")
-    print(f"  (Black-Scholes, wrongly treating F as a spot price, would say ${bs_as_spot:.4f}: "
-          f"{bs_as_spot / price - 1:+.1%})")
-
-    mc = monte_carlo_option_price(
-        f0, strike, r, sigma, T, n_sims=args.n_sims, option_type=kind, underlying="futures",
-        antithetic=not args.no_antithetic, control_variate=not args.no_control_variate, seed=args.seed,
-    )
-    diff = mc.price - price
+    mc = report.mc
+    diff = mc.price - report.price
     ok = abs(diff) < 1.96 * mc.std_error
     print(f"\nMonte Carlo ({mc.n_paths:,} paths): price = ${mc.price:.4f} "
           f"(95% CI: [{mc.ci_95[0]:.4f}, {mc.ci_95[1]:.4f}])")
@@ -84,13 +122,8 @@ def main() -> None:
           f"{'within 95% CI, sanity check passed' if ok else 'OUTSIDE 95% CI (expected ~5% of runs by chance; rerun with a different --seed if this persists)'}")
 
     print(f"\nVariance reduction, same {args.n_sims:,} paths and seed:")
-    plain_se = None
-    for label, antithetic, control in [("plain", False, False), ("antithetic", True, False),
-                                       ("control variate", False, True), ("both", True, True)]:
-        res = monte_carlo_option_price(f0, strike, r, sigma, T, n_sims=args.n_sims, option_type=kind,
-                                       underlying="futures", antithetic=antithetic, control_variate=control,
-                                       seed=args.seed)
-        plain_se = plain_se or res.std_error
+    plain_se = report.variance_reduction["plain"].std_error
+    for label, res in report.variance_reduction.items():
         print(f"  {label:<16} std error = {res.std_error:.5f}  "
               f"(~{(plain_se / res.std_error) ** 2:.1f}x fewer paths than plain for the same precision)")
 

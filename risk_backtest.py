@@ -8,7 +8,6 @@ any claim that one variant is better calibrated than another.
 """
 
 import argparse
-import itertools
 import time
 
 import matplotlib.pyplot as plt
@@ -18,8 +17,7 @@ from matplotlib.lines import Line2D
 
 from data import fetch_silver_prices
 from plot_style import BLUE, CRITICAL, INK_SECONDARY, MUTED, apply_style
-from risk import rolling_var_backtest
-from risk_model import CALIBRATIONS, DISTS, PROCESS_MODELS, RiskModelSpec, RollingForecaster
+from risk_model import CALIBRATIONS, DISTS, PROCESS_MODELS, all_specs, backtest_variants
 
 
 def parse_args() -> argparse.Namespace:
@@ -86,27 +84,19 @@ def main() -> None:
     for c in args.confidence:
         print(f"  {c:.0%}: ~{n_tests * (1 - c):.1f} exceptions expected from a correctly calibrated model")
 
-    rows = []
-    for calibration, model, dist in itertools.product(args.calibrations, args.models, args.dists):
-        spec = RiskModelSpec(calibration=calibration, model=model, dist=dist, t_df=args.t_df)
-        started = time.perf_counter()
-        forecaster = RollingForecaster(spec, args.horizon_days, args.n_sims, args.window,
-                                       refit_every=args.refit_every, seed=args.seed)
-        results = rolling_var_backtest(prices, forecaster, args.horizon_days, args.confidence,
-                                       min_history=args.window)
-        row = {"model": spec.label}
-        for c, bt in results.items():
-            row[f"exceptions_{c:.0%}"] = bt.n_exceptions
-            row[f"rate_{c:.0%}"] = bt.exception_rate
-            row[f"kupiec_p_{c:.0%}"] = bt.kupiec_pvalue
-            row[f"cluster_p_{c:.0%}"] = bt.independence_pvalue
-            row[f"rejected_{c:.0%}"] = bt.rejected
-        rows.append(row)
+    started = time.perf_counter()
+
+    def report(spec, results) -> None:
+        nonlocal started
         verdicts = ", ".join(f"{c:.0%} {bt.verdict}" for c, bt in results.items())
         print(f"  {spec.label:<32} {verdicts}  ({time.perf_counter() - started:.0f}s)")
+        started = time.perf_counter()
 
-    table = pd.DataFrame(rows)
-    shown = table.drop(columns=[c for c in table.columns if c.startswith("rejected_")])
+    specs = all_specs(args.calibrations, args.models, args.dists, t_df=args.t_df)
+    table = backtest_variants(prices, specs, args.horizon_days, args.confidence, window=args.window,
+                              n_sims=args.n_sims, refit_every=args.refit_every, seed=args.seed, on_result=report)
+    shown = table.drop(columns=[c for c in table.columns
+                                if c.startswith(("rejected_", "verdict_")) or c in ("calibration", "process", "dist")])
     print("\nException rates and test p-values (Kupiec: right number of exceptions? "
           "cluster: Christoffersen independence):")
     print(shown.to_string(index=False, formatters={

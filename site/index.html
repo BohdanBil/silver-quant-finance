@@ -1,0 +1,290 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Silver Quant Research</title>
+  <meta name="description" content="Risk, forecasting and option-pricing results for COMEX silver, with out-of-sample tests.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232a78d6'/%3E%3Cpath d='M6 22 L12 14 L17 18 L26 8' stroke='white' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="styles.css">
+  <script>
+    try {
+      const saved = localStorage.getItem("theme");
+      if (saved === "light" || saved === "dark") document.documentElement.dataset.theme = saved;
+    } catch (e) {}
+  </script>
+</head>
+<body>
+  <header class="site-header">
+    <div class="header-inner">
+      <div class="brand">
+        <h1>Silver Quant Research</h1>
+        <p>Risk, forecasting and option pricing for COMEX silver, tested out of sample</p>
+      </div>
+      <div class="header-actions">
+        <span class="badge" id="as-of-badge">Loading results…</span>
+        <button class="icon-button" id="theme-toggle" type="button" aria-label="Switch between light and dark theme">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <nav class="site-nav" aria-label="Sections">
+    <div class="nav-inner">
+      <a href="#overview">Overview</a>
+      <a href="#risk">Risk simulation</a>
+      <a href="#backtest">Risk backtest</a>
+      <a href="#forecast">Forecasting</a>
+      <a href="#robustness">Robustness</a>
+      <a href="#options">Options</a>
+      <a href="#method">Method</a>
+    </div>
+  </nav>
+
+  <main>
+    <section class="page" id="page-overview" aria-labelledby="h-overview">
+      <div class="page-intro">
+        <h2 id="h-overview">Three questions about silver</h2>
+        <p>How much can a silver position lose, and is the risk model calibrated? Is there a predictable
+          signal in gold, macro or positioning data? What is an option on silver futures worth? Every
+          answer below comes from tests that only use data available at the time.</p>
+      </div>
+      <div class="grid tiles" id="overview-tiles"></div>
+      <div class="card" style="margin-bottom:16px">
+        <h3>Silver futures price, last 10 years</h3>
+        <p class="sub">COMEX front-month (SI=F), daily close. Hover for values.</p>
+        <div class="chart" id="price-chart"></div>
+        <details class="data"><summary>Show data</summary><div id="price-table"></div></details>
+      </div>
+      <div class="grid cards-nav" id="overview-cards"></div>
+    </section>
+
+    <section class="page" id="page-risk" aria-labelledby="h-risk">
+      <div class="page-intro">
+        <h2 id="h-risk">Risk simulation</h2>
+        <p>Monte Carlo price paths for a 1,000 oz long position over the next 21 trading days. Pick a
+          calibration, price process and shock distribution to see how the forecast and its own
+          out-of-sample backtest change.</p>
+      </div>
+      <div class="controls" id="risk-controls"></div>
+      <div class="grid tiles" id="risk-tiles"></div>
+      <div class="grid grid-2">
+        <div class="card">
+          <h3>Simulated price paths</h3>
+          <p class="sub" id="fan-sub"></p>
+          <div id="fan-legend"></div>
+          <div class="chart" id="fan-chart"></div>
+          <details class="data"><summary>Show data</summary><div id="fan-table"></div></details>
+        </div>
+        <div class="card">
+          <h3>Profit and loss distribution</h3>
+          <p class="sub" id="pnl-sub"></p>
+          <div id="pnl-legend"></div>
+          <div class="chart" id="pnl-chart"></div>
+          <details class="data"><summary>Show data</summary><div id="pnl-table"></div></details>
+        </div>
+      </div>
+      <div class="card">
+        <h3>Does this model's VaR hold up out of sample?</h3>
+        <p class="sub" id="risk-bt-sub"></p>
+        <div id="risk-bt-table"></div>
+      </div>
+    </section>
+
+    <section class="page" id="page-backtest" aria-labelledby="h-backtest">
+      <div class="page-intro">
+        <h2 id="h-backtest">Risk model backtest</h2>
+        <p id="backtest-intro"></p>
+      </div>
+      <div class="callout" id="backtest-callout"></div>
+      <div class="grid grid-2">
+        <div class="card">
+          <h3>95% VaR: share of days breached</h3>
+          <p class="sub">Each row is one model variant. The line marks the 5% a calibrated model should breach.</p>
+          <div id="dots-legend-95"></div>
+          <div class="chart" id="dots-95"></div>
+        </div>
+        <div class="card">
+          <h3>99% VaR: share of days breached</h3>
+          <p class="sub">The line marks the 1% a calibrated model should breach.</p>
+          <div id="dots-legend-99"></div>
+          <div class="chart" id="dots-99"></div>
+        </div>
+      </div>
+      <div class="card">
+        <h3>All variants</h3>
+        <p class="sub">Kupiec: is the number of breaches right? Clustering: Christoffersen independence test. Click a column to sort.</p>
+        <div id="backtest-table"></div>
+      </div>
+    </section>
+
+    <section class="page" id="page-forecast" aria-labelledby="h-forecast">
+      <div class="page-intro">
+        <h2 id="h-forecast">Forecasting 21-day returns</h2>
+        <p>Four simple baselines and six machine-learning models, refit walk-forward with a purge gap
+          so no training label overlaps the period being predicted. Features: gold, real rates,
+          breakeven inflation, the dollar index and CFTC positioning.</p>
+      </div>
+      <div class="controls" id="forecast-controls"></div>
+      <div class="callout" id="forecast-callout"></div>
+      <div class="grid tiles" id="forecast-tiles"></div>
+      <div class="grid grid-2">
+        <div class="card">
+          <h3>Out-of-sample R² vs a random walk</h3>
+          <p class="sub">Above zero means smaller squared errors than always predicting a 0% return.</p>
+          <div class="chart" id="r2-chart"></div>
+        </div>
+        <div class="card">
+          <h3 id="equity-title">Trading the best model</h3>
+          <p class="sub" id="equity-sub"></p>
+          <div id="equity-legend"></div>
+          <div class="chart" id="equity-chart"></div>
+        </div>
+      </div>
+      <div class="card" style="margin-bottom:16px">
+        <h3>Every model, every metric</h3>
+        <p class="sub">CW: Clark-West test against the random walk. PT: Pesaran-Timmermann test of directional skill. Holm: adjusted for testing all ten models. n/a: nothing to test, e.g. a constant prediction.</p>
+        <div id="forecast-table"></div>
+      </div>
+      <div class="grid grid-2">
+        <div class="card">
+          <h3>Does COT positioning help?</h3>
+          <p class="sub">Change in OOS R² from adding the three COT features, per ML model.</p>
+          <div class="chart" id="ablation-chart"></div>
+          <details class="data"><summary>Show data</summary><div id="ablation-table"></div></details>
+        </div>
+        <div class="card">
+          <h3>Coefficient stability</h3>
+          <p class="sub" id="stability-sub"></p>
+          <div id="stability-table"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="page" id="page-robustness" aria-labelledby="h-robustness">
+      <div class="page-intro">
+        <h2 id="h-robustness">Robustness: horizons and regimes</h2>
+        <p id="robustness-intro"></p>
+      </div>
+      <div class="controls" id="robustness-controls"></div>
+      <div class="card" style="margin-bottom:16px">
+        <h3 id="heatmap-title">Model × horizon</h3>
+        <p class="sub" id="heatmap-sub"></p>
+        <div class="chart" id="heatmap"></div>
+        <div class="scale" id="heatmap-scale"></div>
+      </div>
+      <div class="callout" id="contrib-callout"></div>
+      <div class="grid grid-2-3">
+        <div class="card">
+          <h3>Significance after adjustment</h3>
+          <p class="sub">Cells with p &lt; 0.05, raw and after correcting for the number of tests.</p>
+          <div id="counts-table"></div>
+        </div>
+        <div class="card">
+          <h3>Single-day effect on the positive R² cells</h3>
+          <p class="sub">Share of each cell's gain over the random walk that comes from its best test day.</p>
+          <div id="contrib-table"></div>
+        </div>
+      </div>
+      <div class="card">
+        <h3>By market regime (21-day horizon)</h3>
+        <p class="sub">Bull/bear: price above/below its 200-day average. High/low vol: 21-day realized vol above/below its median.</p>
+        <div class="controls" id="regime-controls" style="margin-bottom:12px"></div>
+        <div id="regime-table"></div>
+      </div>
+    </section>
+
+    <section class="page" id="page-options" aria-labelledby="h-options">
+      <div class="page-intro">
+        <h2 id="h-options">Option pricing</h2>
+        <p id="options-intro"></p>
+      </div>
+      <div class="grid tiles" id="options-tiles"></div>
+      <div class="grid grid-2">
+        <div class="card">
+          <h3>Price across strikes</h3>
+          <p class="sub">Same inputs, strikes from 70% to 130% of the futures price.</p>
+          <div id="curve-legend"></div>
+          <div class="chart" id="curve-chart"></div>
+          <details class="data"><summary>Show data</summary><div id="curve-table"></div></details>
+        </div>
+        <div class="card">
+          <h3>Inputs and Greeks</h3>
+          <p class="sub">Black-76, at the money.</p>
+          <div id="greeks-table"></div>
+        </div>
+      </div>
+      <div class="grid grid-2">
+        <div class="card">
+          <h3>Monte Carlo convergence</h3>
+          <p class="sub">Estimate and 95% interval as paths increase, with and without variance reduction.</p>
+          <div id="conv-legend"></div>
+          <div class="chart" id="conv-chart"></div>
+          <details class="data"><summary>Show data</summary><div id="conv-table"></div></details>
+        </div>
+        <div class="card">
+          <h3>Variance reduction</h3>
+          <p class="sub">How many times fewer paths each technique needs for the same precision, at 200,000 paths.</p>
+          <div class="chart" id="vr-chart"></div>
+        </div>
+      </div>
+      <div class="callout" id="bias-callout"></div>
+    </section>
+
+    <section class="page" id="page-method" aria-labelledby="h-method">
+      <div class="page-intro">
+        <h2 id="h-method">Method and caveats</h2>
+        <p>How the results are produced, what guards against fooling ourselves, and what the numbers can't tell you.</p>
+      </div>
+      <div class="card prose">
+        <h3>Reproduce these results</h3>
+        <pre><code>python -m venv .venv &amp;&amp; source .venv/bin/activate
+pip install -r requirements.txt
+python export_results.py --as-of <span id="method-as-of">2026-10-23</span>
+python -m http.server -d site 8000   # then open http://localhost:8000</code></pre>
+        <p>Data comes from Yahoo Finance (silver and gold futures), FRED (real rates, breakeven inflation,
+          dollar index, T-bill rate) and the CFTC (Commitments of Traders). Downloads are cached by date,
+          so a pinned <code>--as-of</code> run reads identical data every time.</p>
+
+        <h3>Safeguards</h3>
+        <ul>
+          <li><strong>No lookahead.</strong> Each macro series is aligned to the date it was published,
+            not the date it describes: daily yields one business day later, the weekly dollar index the
+            Tuesday after its Monday release, COT reports after their Friday release.</li>
+          <li><strong>Purged walk-forward.</strong> Each refit trains only on labels whose 21-day window ends
+            before the test date. Lasso and ElasticNet use the same gap inside their own cross-validation.</li>
+          <li><strong>Independent test points.</strong> Forecast targets and VaR windows never overlap, so
+            every test has the independent samples it assumes.</li>
+          <li><strong>Out-of-sample risk backtests.</strong> Each day's VaR is calibrated on the previous 504
+            trading days only, and breaches are measured as a share of position value, not in dollars.</li>
+          <li><strong>Multiple comparisons.</strong> With 40 model × horizon cells and two tests each, a few
+            raw p &lt; 0.05 hits are expected by chance. Results are adjusted with Bonferroni, Holm and
+            Benjamini-Hochberg.</li>
+        </ul>
+
+        <h3>Known limitations</h3>
+        <ul>
+          <li>SI=F is a continuous front-month series with no roll adjustment, so roll dates add small
+            artificial returns. Listed options are on a specific contract month.</li>
+          <li>Option prices use a GARCH forecast as a stand-in for implied volatility.</li>
+          <li>The Student-t degrees of freedom (5) and the jump threshold (4 local standard deviations) are fixed, not estimated.</li>
+          <li>COT releases shift by a day in holiday weeks; alignment uses the normal schedule.</li>
+        </ul>
+      </div>
+    </section>
+
+    <div class="empty" id="no-data" hidden>
+      No results found. Run <code>python export_results.py</code> from the project folder, then reload this page.
+    </div>
+  </main>
+
+  <footer class="site-footer" id="footer"></footer>
+
+  <script src="data/results.js"></script>
+  <script src="charts.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

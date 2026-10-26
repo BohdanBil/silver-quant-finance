@@ -15,6 +15,26 @@ modules because they need different tools:
 Both main findings are negative: no forecasting model beats a random walk once you correct for
 how many were tried, and no variant of the risk model holds up at 99% out of sample.
 
+## Results website
+
+Every result below is also in an interactive results site: charts with hover tooltips, a data
+table under each chart, light and dark themes, and a switcher across all 16 risk-model variants.
+
+![Results website](docs/site_preview.png)
+
+It's a static site with no dependencies. Open `site/index.html` in a browser, or serve it:
+
+```bash
+python -m http.server -d site 8000   # then open http://localhost:8000
+```
+
+To regenerate its data (about 10 minutes, mostly the forecasting walk-forwards):
+
+```bash
+python export_results.py --as-of 2026-10-23              # everything
+python export_results.py --as-of 2026-10-23 --only risk  # one section, keeping the rest
+```
+
 ## Results at a glance
 
 All numbers are from data up to **2026-10-23** and can be reproduced exactly from the local
@@ -81,6 +101,8 @@ pytest   # 59 offline tests on synthetic data, ~3s
 | [forecast_robustness.py](forecast_robustness.py) | CLI: sweep 1d/5d/21d/63d horizons and bull/bear/high-vol/low-vol regimes |
 | [option_pricing.py](option_pricing.py) | Black-76 / Black-Scholes prices + Greeks; risk-neutral Monte Carlo with antithetic + control variates |
 | [option_main.py](option_main.py) | CLI: price a silver futures option both ways from live inputs and check they agree |
+| [export_results.py](export_results.py) | Runs every analysis once and writes `site/data/results.json` for the website |
+| [site/](site) | Static results website (HTML/CSS/JS, no dependencies) |
 | [plot_style.py](plot_style.py) | Shared figure styling |
 | [tests/](tests) | Offline tests (pricing, estimation, backtests, significance tests, no-lookahead checks) |
 
@@ -179,7 +201,7 @@ python option_main.py --option-type put --strike 50 --maturity-days 90
   T=1y: call 10.4506) and put-call parity, and every Greek against finite differences, for
   both Black-76 and Black-Scholes.
 - **The Monte Carlo pricer is unbiased and its standard errors are honest.** Across 400 seeds the
-  mean pricing error is +0.000006 (z = 0.04), and 5.2% of runs fall outside their own 95%
+  mean pricing error is +0.000006 (z = 0.04), and 5.3% of runs fall outside their own 95%
   interval. At the default seed (42) it happens to land 2.0 standard errors away, one of those 5%
   runs, and the CLI says so. The test suite checks that each run's reported standard error matches
   the actual spread across runs, for every variance-reduction setting.

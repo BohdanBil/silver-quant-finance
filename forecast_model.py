@@ -388,6 +388,15 @@ class EconomicSignificanceResult:
     buy_hold_sharpe: float
 
 
+def strategy_returns(result: WalkForwardResult, cost_bps: float = 5.0) -> tuple[np.ndarray, np.ndarray]:
+    """(net log return per period, units traded per period) for the sign(y_pred) strategy
+    described in economic_significance."""
+    position = np.sign(result.y_pred)
+    position_prev = np.concatenate([[0.0], position[:-1]])
+    units_traded = np.abs(position - position_prev)
+    return position * result.y_true - units_traded * cost_bps / 10_000, units_traded
+
+
 def economic_significance(
     result: WalkForwardResult, horizon_days: int, cost_bps: float = 5.0
 ) -> EconomicSignificanceResult:
@@ -406,13 +415,7 @@ def economic_significance(
     so cumulative P&L is just their running sum; expm1 converts a summed
     log-return back to an arithmetic (%) return for reporting.
     """
-    position = np.sign(result.y_pred)
-    gross_period_return = position * result.y_true
-
-    position_prev = np.concatenate([[0.0], position[:-1]])
-    units_traded = np.abs(position - position_prev)
-    net_period_return = gross_period_return - units_traded * cost_bps / 10_000
-
+    net_period_return, units_traded = strategy_returns(result, cost_bps)
     periods_per_year = TRADING_DAYS_PER_YEAR / horizon_days
 
     def _annualize(period_returns: np.ndarray) -> tuple[float, float, float]:
@@ -490,3 +493,25 @@ def regime_conditional_metrics(result: WalkForwardResult, regimes: pd.DataFrame,
         metrics = forecast_metrics(result.y_pred[mask], result.y_true[mask], result.y_bench_mean[mask])
         rows.append({"model": result.model_name, "regime": label, **metrics})
     return pd.DataFrame(rows)
+
+
+def largest_contribution(result: WalkForwardResult) -> dict:
+    """How much of a model's edge over the random walk comes from its single best test point.
+
+    OOS R^2 sums squared errors, so one extreme day can carry it: a model that
+    happened to lean the right way into a crash looks skilful overall. Reports
+    that day, its share of the total squared-error reduction (can exceed 100%
+    when the other points net out negative), and the R^2 with it removed.
+    """
+    gain = result.y_true**2 - (result.y_true - result.y_pred) ** 2
+    top = int(np.argmax(gain))
+    keep = np.arange(len(gain)) != top
+    total = float(gain.sum())
+    return {
+        "date": result.dates[top],
+        "actual": float(result.y_true[top]),
+        "predicted": float(result.y_pred[top]),
+        "share_of_gain": float(gain[top] / total) if total > 0 else float("nan"),
+        "oos_r2_without": forecast_metrics(result.y_pred[keep], result.y_true[keep],
+                                           result.y_bench_mean[keep])["oos_r2_vs_zero"],
+    }

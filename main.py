@@ -8,14 +8,14 @@ from matplotlib.ticker import FuncFormatter, MaxNLocator
 
 from data import fetch_silver_prices, log_returns_of
 from plot_style import BLUE, BLUE_RAMP, INK, INK_SECONDARY, ORANGE, SURFACE, apply_style, thousands
-from risk import CoverageTest, rolling_var_backtest, var_cvar
+from risk import CoverageTest, var_cvar
 from risk_model import (
     CALIBRATIONS,
     DISTS,
     PROCESS_MODELS,
     CalibratedModel,
     RiskModelSpec,
-    RollingForecaster,
+    backtest_spec,
     calibrate,
     simulate_paths,
 )
@@ -111,17 +111,13 @@ def run_backtests(prices, spec: RiskModelSpec, args: argparse.Namespace) -> None
 
     print(f"\nOut-of-sample VaR backtest -- each forecast calibrated on the {window} trading days before it "
           f"and nothing later; losses in % of position value:")
-    one_day = rolling_var_backtest(
-        prices, RollingForecaster(spec, 1, args.backtest_sims, window, seed=args.seed),
-        horizon_days=1, confidence_levels=args.confidence, min_history=window,
-    )
+    one_day = backtest_spec(prices, spec, 1, args.confidence, window=window, n_sims=args.backtest_sims,
+                            seed=args.seed)
     print_backtest("  1-day VaR of the same model, every day:", one_day)
 
     if args.horizon_days > 1:
-        h_day = rolling_var_backtest(
-            prices, RollingForecaster(spec, args.horizon_days, args.backtest_sims, window, seed=args.seed),
-            horizon_days=args.horizon_days, confidence_levels=args.confidence, min_history=window,
-        )
+        h_day = backtest_spec(prices, spec, args.horizon_days, args.confidence, window=window,
+                              n_sims=args.backtest_sims, seed=args.seed)
         n_windows = next(iter(h_day.values())).n_obs
         expected_99 = n_windows * (1 - max(args.confidence))
         print_backtest(f"  {args.horizon_days}-day VaR, non-overlapping windows "
